@@ -1,5 +1,10 @@
 {
   "dependencies": [
-    "joltphysics"
+    {
+      "name": "joltphysics",
+      "features": [ "debugrenderer" ]
+    },
+    "glfw3",
+    "stb"
   ]
 }

@@ -1,6 +1,7 @@
 {
     "cmake.sourceDirectory": "C:/Users/jwong/Documents/projects/temporary-testing",
     "C_Cpp.intelliSenseEngine": "default",
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
     "cmake.configureOnOpen": false,
     "cmake.buildDirectory": "${workspaceFolder}/build"
 }
