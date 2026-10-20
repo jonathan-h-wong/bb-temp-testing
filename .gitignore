@@ -1,0 +1,41 @@
+# Build directories
+/build
+/dist
+/bin
+/out
+
+# vcpkg installed packages (local, machine-specific)
+/vcpkg_installed
+/vcpkg-configuration.lock.json
+
+# CMake cache and generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake
+
+# Build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+
+# CUDA compilation intermediates
+*.cubin
+*.fatbin
+*.ptx
+
+# VS Code local config (keep shared settings.json but ignore personal overrides)
+.vscode/launch.json
+
+# IDE / OS noise
+.vs/
+*.user
+*.suo
+Thumbs.db
+.DS_Store
