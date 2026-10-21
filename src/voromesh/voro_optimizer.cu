@@ -26,6 +26,8 @@
 
 #include "voromesh/voro_optimizer.h"
 
+#include "mesh_assembly.h"
+
 #include <cub/device/device_scan.cuh>
 #include <cuda_runtime.h>
 
@@ -55,8 +57,6 @@ constexpr int kLossK        = 12; // neighbours per target point (paper: 16 in 3
 constexpr int kCellK        = 32; // neighbours tried per cell before the brute-force fallback
 constexpr int kMaxCellVerts = 24;
 constexpr int kBlock        = 128;
-// Edge labels: >= 0 is the neighbouring generator, -1..-4 the domain box sides.
-constexpr int kBoxLabels    = 4;
 
 __device__ __forceinline__ float2 operator+(float2 a, float2 b) { return make_float2(a.x + b.x, a.y + b.y); }
 __device__ __forceinline__ float2 operator-(float2 a, float2 b) { return make_float2(a.x - b.x, a.y - b.y); }
@@ -776,7 +776,7 @@ VoroMesh2D VoroOptimizer::Extract()
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(d.stop, d.stream));
     CUDA_CHECK(cudaEventSynchronize(d.stop));
-    CUDA_CHECK(cudaEventElapsedTime(&mesh.gpuMs, d.start, d.stop));
+    CUDA_CHECK(cudaEventElapsedTime(&mesh.cellsMs, d.start, d.stop));
 
     auto t0 = std::chrono::steady_clock::now();
 
@@ -794,66 +794,15 @@ VoroMesh2D VoroOptimizer::Extract()
     CUDA_CHECK(cudaMemcpy(flags, d.flags, sizeof(flags), cudaMemcpyDeviceToHost));
     mesh.unsafeCells   = flags[0];
     mesh.overflowCells = flags[1];
+    mesh.clippedCells  = n;
 
-    // Compact the polygons into CSR.
-    mesh.cellStart.resize(n + 1);
-    mesh.cellStart[0] = 0;
-    for (int i = 0; i < n; ++i) mesh.cellStart[i + 1] = mesh.cellStart[i] + counts[i];
-    mesh.cellVerts.resize(mesh.cellStart[n]);
-    for (int i = 0; i < n; ++i)
-        std::copy_n(verts.begin() + size_t(i) * kMaxCellVerts, counts[i], mesh.cellVerts.begin() + mesh.cellStart[i]);
+    detail::AssembleMesh(mesh, n, [&](int i, int &c, const Vec2 *&v, const int *&e) {
+        c = counts[i];
+        v = verts.data() + size_t(i) * kMaxCellVerts;
+        e = labels.data() + size_t(i) * kMaxCellVerts;
+    });
 
-    // Boundary edges: every edge of an inside cell whose other side is an
-    // outside cell or the domain box. A cell vertex sits between edges with
-    // labels a and b, so it is equidistant to generators {i, a, b}.
-    auto key = [](int a, int b, int c) {
-        uint64_t v0 = uint64_t(a + kBoxLabels), v1 = uint64_t(b + kBoxLabels), v2 = uint64_t(c + kBoxLabels);
-        if (v0 > v1) std::swap(v0, v1);
-        if (v1 > v2) std::swap(v1, v2);
-        if (v0 > v1) std::swap(v0, v1);
-        return (v0 << 42) | (v1 << 21) | v2;
-    };
-    std::unordered_map<uint64_t, int> vertexOf;
-    auto vertex = [&](uint64_t k, Vec2 p) {
-        auto [it, inserted] = vertexOf.try_emplace(k, (int)mesh.vertices.size());
-        if (inserted) mesh.vertices.push_back(p);
-        return it->second;
-    };
-    for (int i = 0; i < n; ++i) {
-        if (!mesh.inside[i]) continue;
-        int c = counts[i];
-        const int  *lab = labels.data() + size_t(i) * kMaxCellVerts;
-        const Vec2 *pos = verts.data() + size_t(i) * kMaxCellVerts;
-        for (int k = 0; k < c; ++k) {
-            int l = lab[k];
-            if (l >= 0 && mesh.inside[l]) continue;
-            int prev = lab[(k + c - 1) % c], next = lab[(k + 1) % c];
-            int a = vertex(key(i, prev, l), pos[k]);
-            int b = vertex(key(i, l, next), pos[(k + 1) % c]);
-            mesh.edges.push_back({a, b});
-        }
-    }
-
-    // Watertight iff each vertex has exactly one outgoing and one incoming edge.
-    std::vector<int> next(mesh.vertices.size(), -1), inDeg(mesh.vertices.size(), 0);
-    mesh.watertight = true;
-    for (auto [a, b] : mesh.edges) {
-        if (next[a] != -1) mesh.watertight = false;
-        next[a] = b;
-        ++inDeg[b];
-    }
-    for (size_t v = 0; v < next.size(); ++v)
-        if (next[v] == -1 || inDeg[v] != 1) mesh.watertight = false;
-    if (mesh.watertight) {
-        std::vector<uint8_t> seen(next.size(), 0);
-        for (size_t v = 0; v < next.size(); ++v) {
-            if (seen[v]) continue;
-            ++mesh.loops;
-            for (int w = (int)v; !seen[w]; w = next[w]) seen[w] = 1;
-        }
-    }
-
-    mesh.hostMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    mesh.assemblyMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return mesh;
 }
 

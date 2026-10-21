@@ -63,8 +63,9 @@ struct VoroMesh2D
     int   loops         = 0;     // closed boundary curves
     int   unsafeCells   = 0;     // cells whose kNN clip could not be certified (brute-force fallback)
     int   overflowCells = 0;     // cells that exceeded the fixed vertex budget (should stay 0)
-    float gpuMs         = 0.0f;  // hash grid + cell clipping + occupancy
-    float hostMs        = 0.0f;  // download + boundary assembly
+    float cellsMs       = 0.0f;  // hash grid + cell clipping + occupancy (GPU time on the GPU path)
+    int   clippedCells  = 0;     // cells (re)computed by this extraction
+    float assemblyMs    = 0.0f;  // download (GPU path) + boundary assembly
 };
 
 class VoroOptimizer

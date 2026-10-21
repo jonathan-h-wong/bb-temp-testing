@@ -93,7 +93,10 @@ endif()
 # ---------------------------------------------------------------------------
 # poisson – GPU Poisson disk sampling (grid-based parallel dart throwing)
 # ---------------------------------------------------------------------------
-add_library(poisson poisson/poisson_disk.cu)
+add_library(poisson
+    poisson/poisson_disk.cu
+    poisson/poisson_disk_cpu.cpp
+)
 
 target_include_directories(poisson
     PUBLIC
@@ -122,6 +125,7 @@ add_library(voromesh
     voromesh/shape2d.cpp
     voromesh/canvas.cpp
     voromesh/voro_optimizer.cu
+    voromesh/cpu_voro_optimizer.cpp
 )
 
 target_include_directories(voromesh

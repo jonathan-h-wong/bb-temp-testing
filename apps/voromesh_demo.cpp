@@ -23,20 +23,25 @@
 //   Left drag     carve (disc -> outside)
 //   Right drag    add (disc -> inside)
 //   Wheel / [ ]   brush radius
+//   - / =         fewer / more optimisation steps per stamp (0 shows the raw reseed)
 //   R             reset to the heart (global optimisation)
 //   F / V         toggle cell fill / Voronoi edges
 //   G / T         toggle generators / canvas surface points
 //   Esc           quit (prints edit timing statistics)
 //
-// Usage: voromesh_demo [radius=24] [raster=1024] [localIterations=100] [--shot prefix]
+// Usage: voromesh_demo [radius=24] [raster=1024] [localIterations=100] [--cpu] [--shot prefix]
 //   radius            Poisson radius of the generators (domain is 1024 x 1024)
 //   raster            canvas resolution across the domain (voxel = 1024 / raster)
 //   localIterations   optimisation steps after each stamp
+//   --cpu             run Poisson sampling, optimisation and extraction on the
+//                     CPU (CpuSampler + CpuVoroOptimizer) instead of CUDA
 //   --shot            run a scripted edit sequence, print timings, save
 //                     <prefix>_before.png and <prefix>_after.png, then exit
 // ---------------------------------------------------------------------------
 #include "poisson/poisson_disk.h"
+#include "poisson/poisson_disk_cpu.h"
 #include "voromesh/canvas.h"
+#include "voromesh/cpu_voro_optimizer.h"
 #include "voromesh/shape2d.h"
 #include "voromesh/voro_optimizer.h"
 
@@ -52,6 +57,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -77,13 +83,31 @@ double Ms(Clock::time_point a, Clock::time_point b)
 }
 
 // ---------------------------------------------------------------------------
+// Backends: where Poisson sampling, optimisation and extraction run
+// ---------------------------------------------------------------------------
+struct GpuBackend
+{
+    using Sampler   = poisson::Sampler;
+    using Optimizer = voromesh::VoroOptimizer;
+    static constexpr const char *kName = "GPU";
+};
+
+struct CpuBackend
+{
+    using Sampler   = poisson::CpuSampler;
+    using Optimizer = voromesh::CpuVoroOptimizer;
+    static constexpr const char *kName = "CPU";
+};
+
+// ---------------------------------------------------------------------------
 // Editor: canvas + Poisson sampler + optimiser, and the local edit pipeline
 // ---------------------------------------------------------------------------
 struct EditTiming
 {
     double canvasMs = 0, uploadMs = 0, poissonMs = 0, optimizeMs = 0, extractMs = 0, totalMs = 0;
-    float  poissonGpuMs = 0, optimizeGpuMs = 0;
-    int    removed = 0, added = 0, slots = 0;
+    float  poissonInnerMs = 0, optimizeInnerMs = 0; // as reported by the sampler / optimiser
+    float  cellsMs = 0, assemblyMs = 0;                // extraction split, as reported by the optimiser
+    int    removed = 0, added = 0, slots = 0, clipped = 0;
 };
 
 struct Region
@@ -91,11 +115,13 @@ struct Region
     int cx0, cy0, cx1, cy1; // Poisson cells / generator slots
 };
 
+template <class Backend>
 class Editor
 {
 public:
     Editor(float radius, float voxel, const voromesh::OptimizerParams &params)
-        : mRadius(radius), mCanvas(kDomain, kDomain, voxel), mOpt(kDomain, kDomain, radius, params)
+        : mRadius(radius), mLocalIterations(params.localIterations), mCanvas(kDomain, kDomain, voxel),
+          mOpt(kDomain, kDomain, radius, params)
     {
     }
 
@@ -105,7 +131,7 @@ public:
         mCanvas.RasterizeShape(voromesh::MakeHeart(0.5f * kDomain, 0.5f * kDomain, 0.8f * kDomain, 4096));
         mOpt.SetTargets(mCanvas.TargetSlots());
         mOpt.SetOccupancy(mCanvas.InsideMasks(), mCanvas.TilesX(), mCanvas.TilesY(), mCanvas.VoxelSize());
-        mSampler = std::make_unique<poisson::Sampler>(kDomain, kDomain, mRadius, 30, seed);
+        mSampler = std::make_unique<typename Backend::Sampler>(kDomain, kDomain, mRadius, 30, seed);
         mOpt.SetGenerators(Slots(), mSampler->GridW(), mSampler->GridH(), mSampler->CellSize());
         float ms = mOpt.Optimize();
         mMesh    = mOpt.Extract();
@@ -132,12 +158,12 @@ public:
         region.cy0 = std::max(int(std::floor((c.y - margin) / cs)), 0);
         region.cx1 = std::min(int(std::ceil((c.x + margin) / cs)), mSampler->GridW());
         region.cy1 = std::min(int(std::ceil((c.y + margin) / cs)), mSampler->GridH());
-        t.poissonGpuMs = mSampler->Resample(region.cx0, region.cy0, region.cx1, region.cy1);
+        t.poissonInnerMs = mSampler->Resample(region.cx0, region.cy0, region.cx1, region.cy1);
         mOpt.UpdateGenerators(Slots(), region.cx0, region.cy0, region.cx1, region.cy1);
         auto t3 = Clock::now();
 
-        mOpt.BeginSchedule(mOpt.Params().localIterations, region.cx0, region.cy0, region.cx1, region.cy1);
-        t.optimizeGpuMs = mOpt.Optimize();
+        mOpt.BeginSchedule(mLocalIterations, region.cx0, region.cy0, region.cx1, region.cy1);
+        t.optimizeInnerMs = mOpt.Optimize();
         auto t4 = Clock::now();
 
         mMesh   = mOpt.Extract();
@@ -152,6 +178,9 @@ public:
         t.removed    = e.removed;
         t.added      = e.added;
         t.slots      = (region.cx1 - region.cx0) * (region.cy1 - region.cy0);
+        t.clipped    = mMesh.clippedCells;
+        t.cellsMs    = mMesh.cellsMs;
+        t.assemblyMs = mMesh.assemblyMs;
         return true;
     }
 
@@ -164,20 +193,23 @@ public:
         return pts;
     }
 
-    const voromesh::Canvas        &Canvas() const { return mCanvas; }
-    const voromesh::VoroMesh2D    &Mesh() const { return mMesh; }
-    voromesh::VoroOptimizer       &Optimizer() { return mOpt; }
-    const poisson::Sampler        &Sampler() const { return *mSampler; }
-    float                          Radius() const { return mRadius; }
+    const voromesh::Canvas          &Canvas() const { return mCanvas; }
+    const voromesh::VoroMesh2D      &Mesh() const { return mMesh; }
+    typename Backend::Optimizer     &Optimizer() { return mOpt; }
+    const typename Backend::Sampler &Sampler() const { return *mSampler; }
+    float                            Radius() const { return mRadius; }
+    int                              LocalIterations() const { return mLocalIterations; }
+    void                             SetLocalIterations(int n) { mLocalIterations = n; }
 
 private:
     const Vec2 *Slots() const { return reinterpret_cast<const Vec2 *>(mSampler->Cells().data()); }
 
-    float                             mRadius;
-    voromesh::Canvas                  mCanvas;
-    voromesh::VoroOptimizer           mOpt;
-    std::unique_ptr<poisson::Sampler> mSampler;
-    voromesh::VoroMesh2D              mMesh;
+    float                                      mRadius;
+    int                                        mLocalIterations; // optimisation steps per stamp
+    voromesh::Canvas                           mCanvas;
+    typename Backend::Optimizer                mOpt;
+    std::unique_ptr<typename Backend::Sampler> mSampler;
+    voromesh::VoroMesh2D                       mMesh;
 };
 
 // ---------------------------------------------------------------------------
@@ -222,7 +254,8 @@ Accuracy MeasureAccuracy(const voromesh::VoroMesh2D &mesh, const std::vector<Vec
     return acc;
 }
 
-void PrintMesh(const char *label, Editor &editor)
+template <class EditorT>
+void PrintMesh(const char *label, EditorT &editor)
 {
     const voromesh::VoroMesh2D &mesh  = editor.Mesh();
     float                       voxel = editor.Canvas().VoxelSize();
@@ -269,7 +302,7 @@ struct EditStats
         };
         std::printf("Edit timings over %zu stamps (wall clock, incl. sync):\n", edits.size());
         stat("canvas stamp (CPU)", &EditTiming::canvasMs);
-        stat("upload targets+occ", &EditTiming::uploadMs);
+        stat("targets+occupancy in", &EditTiming::uploadMs);
         stat("poisson resample", &EditTiming::poissonMs);
         stat("local optimisation", &EditTiming::optimizeMs);
         stat("extract", &EditTiming::extractMs);
@@ -288,6 +321,7 @@ struct Input
     bool   toggleGens  = false;
     bool   toggleTgts  = false;
     int    brushStep   = 0;
+    int    iterStep    = 0;
     double scroll      = 0.0;
 };
 
@@ -305,6 +339,8 @@ void KeyCallback(GLFWwindow *window, int key, int, int action, int)
     case GLFW_KEY_T:             in->toggleTgts = true; break;
     case GLFW_KEY_RIGHT_BRACKET: in->brushStep = +1; break;
     case GLFW_KEY_LEFT_BRACKET:  in->brushStep = -1; break;
+    case GLFW_KEY_EQUAL:         in->iterStep = +1; break;
+    case GLFW_KEY_MINUS:         in->iterStep = -1; break;
     default: break;
     }
 }
@@ -383,36 +419,39 @@ struct Flash
 
 void PrintEdit(const char *what, Vec2 c, const EditTiming &t, int iterations)
 {
-    std::printf("  %-5s (%4.0f,%4.0f): -%3d +%3d pts, %3d slots | canvas %.3f  upload %.3f  poisson %.3f (%.3f GPU)  "
-                "opt %.3f (%.3f GPU, %d it)  extract %.3f | total %.3f ms\n",
-                what, c.x, c.y, t.removed, t.added, t.slots, t.canvasMs, t.uploadMs, t.poissonMs, t.poissonGpuMs,
-                t.optimizeMs, t.optimizeGpuMs, iterations, t.extractMs, t.totalMs);
+    std::printf("  %-5s (%4.0f,%4.0f): -%3d +%3d pts, %3d slots | canvas %.3f  in %.3f  poisson %.3f  "
+                "opt %.3f (%d it)  extract %.3f (%4d cells %.3f + assembly %.3f) | total %.3f ms\n",
+                what, c.x, c.y, t.removed, t.added, t.slots, t.canvasMs, t.uploadMs, t.poissonMs, t.optimizeMs,
+                iterations, t.extractMs, t.clipped, t.cellsMs, t.assemblyMs, t.totalMs);
 }
 
-int Run(int argc, char **argv)
+struct Options
 {
-    std::vector<const char *> pos;
-    std::string               shot;
-    for (int i = 1; i < argc; ++i) {
-        if (!std::strcmp(argv[i], "--shot") && i + 1 < argc)
-            shot = argv[++i];
-        else
-            pos.push_back(argv[i]);
-    }
-    float radius = pos.size() > 0 ? (float)std::atof(pos[0]) : 24.0f;
-    int   raster = pos.size() > 1 ? std::atoi(pos[1]) : 1024;
+    float                     radius = 24.0f;
+    int                       raster = 1024;
     voromesh::OptimizerParams params;
-    params.localIterations = pos.size() > 2 ? std::atoi(pos[2]) : 100;
-    float voxel            = kDomain / raster;
+    std::string               shot;
+    bool                      cpu = false;
+};
 
-    Editor   editor(radius, voxel, params);
-    unsigned seed = 1;
-    auto     r0   = Clock::now();
-    float    globalMs = editor.Reset(seed);
+template <class Backend>
+int Run(const Options &opt)
+{
+    float radius = opt.radius;
+    int   raster = opt.raster;
+    const voromesh::OptimizerParams &params = opt.params;
+    const std::string               &shot   = opt.shot;
+    float voxel = kDomain / raster;
+
+    Editor<Backend> editor(radius, voxel, params);
+    unsigned        seed     = 1;
+    auto            r0       = Clock::now();
+    float           globalMs = editor.Reset(seed);
+    std::printf("Backend: %s\n", Backend::kName);
     std::printf("Canvas %d x %d (voxel %.3f), Poisson r = %.1f -> %d x %d generator slots\n", raster, raster, voxel,
                 radius, editor.Sampler().GridW(), editor.Sampler().GridH());
-    std::printf("Reset + global optimisation (%d it): %.3f ms GPU, %.3f ms wall\n", params.iterations, globalMs,
-                Ms(r0, Clock::now()));
+    std::printf("Reset + global optimisation (%d it): %.3f ms optimise, %.3f ms wall\n", params.iterations,
+                globalMs, Ms(r0, Clock::now()));
     PrintMesh("heart", editor);
 
     // ---- Window ------------------------------------------------------------
@@ -593,6 +632,18 @@ int Run(int argc, char **argv)
             input.brushStep = 0;
             input.scroll    = 0.0;
         }
+        if (input.iterStep != 0) {
+            // Step along a fixed ladder, starting from the nearest rung.
+            static constexpr int kLadder[] = {0, 10, 25, 50, 100, 200, 400};
+            constexpr int        kRungs    = int(std::size(kLadder));
+            int rung = 0;
+            while (rung + 1 < kRungs && kLadder[rung + 1] <= editor.LocalIterations())
+                ++rung;
+            rung = std::clamp(rung + input.iterStep, 0, kRungs - 1);
+            editor.SetLocalIterations(kLadder[rung]);
+            std::printf("Local optimisation: %d iterations per stamp\n", kLadder[rung]);
+            input.iterStep = 0;
+        }
         if (input.toggleFill)  { showFill = !showFill;       input.toggleFill = false; }
         if (input.toggleEdges) { showEdges = !showEdges;     input.toggleEdges = false; }
         if (input.toggleGens)  { showGens = !showGens;       input.toggleGens = false; }
@@ -644,9 +695,9 @@ int Run(int argc, char **argv)
             const voromesh::VoroMesh2D &mesh = editor.Mesh();
             char title[384];
             std::snprintf(title, sizeof(title),
-                          "VoroMesh 2D | brush %.0f | last edit %.2f ms (canvas %.2f, upload %.2f, poisson %.2f, "
-                          "opt %.2f, extract %.2f) | %zu edits | %s, %d loop(s) | %.0f fps",
-                          brush, last.totalMs, last.canvasMs, last.uploadMs, last.poissonMs, last.optimizeMs,
+                          "VoroMesh 2D [%s] | brush %.0f | opt %d it | last edit %.2f ms (canvas %.2f, in %.2f, "
+                          "poisson %.2f, opt %.2f, extract %.2f) | %zu edits | %s, %d loop(s) | %.0f fps",
+                          Backend::kName, brush, editor.LocalIterations(), last.totalMs, last.canvasMs, last.uploadMs, last.poissonMs, last.optimizeMs,
                           last.extractMs, stats.edits.size(), mesh.watertight ? "watertight" : "NOT WATERTIGHT",
                           mesh.loops, fps);
             glfwSetWindowTitle(window, title);
@@ -659,12 +710,31 @@ int Run(int argc, char **argv)
     return 0;
 }
 
+Options ParseOptions(int argc, char **argv)
+{
+    Options                   opt;
+    std::vector<const char *> pos;
+    for (int i = 1; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--shot") && i + 1 < argc)
+            opt.shot = argv[++i];
+        else if (!std::strcmp(argv[i], "--cpu"))
+            opt.cpu = true;
+        else
+            pos.push_back(argv[i]);
+    }
+    if (pos.size() > 0) opt.radius = (float)std::atof(pos[0]);
+    if (pos.size() > 1) opt.raster = std::atoi(pos[1]);
+    if (pos.size() > 2) opt.params.localIterations = std::atoi(pos[2]);
+    return opt;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
 {
     try {
-        return Run(argc, argv);
+        Options opt = ParseOptions(argc, argv);
+        return opt.cpu ? Run<CpuBackend>(opt) : Run<GpuBackend>(opt);
     } catch (const std::exception &e) {
         std::fprintf(stderr, "Fatal: %s\n", e.what());
         return 1;
