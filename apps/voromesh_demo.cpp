@@ -32,14 +32,19 @@
 //   R             reset to the heart (global optimisation)
 //   F / V         toggle fill (interior + shell cells) / surface-band cell edges
 //   G / T         toggle shell generators / canvas surface points
+//   P             toggle parallel optimisation + extraction (CPU backend)
 //   Esc           quit (prints edit timing statistics)
 //
-// Usage: voromesh_demo [radius=24] [raster=1024] [localIterations=100] [--cpu] [--shot prefix]
+// Usage: voromesh_demo [radius=24] [raster=1024] [localIterations=100] [--cpu] [--threads N]
+//                      [--shot prefix]
 //   radius            Poisson radius of the generators (domain is 1024 x 1024)
 //   raster            canvas resolution across the domain (voxel = 1024 / raster)
 //   localIterations   optimisation steps after each stamp
 //   --cpu             run Poisson sampling, optimisation and extraction on the
 //                     CPU (CpuSampler + CpuVoroOptimizer) instead of CUDA
+//   --threads         threads for the CPU backend's parallel loops (default:
+//                     all hardware threads; 1 = serial). They run on a Jolt
+//                     JobSystemThreadPool, the same kind physics would use.
 //   --shot            run a scripted edit sequence, print timings, save
 //                     <prefix>_before.png and <prefix>_after.png, then exit
 // ---------------------------------------------------------------------------
@@ -47,8 +52,16 @@
 #include "poisson/poisson_disk_cpu.h"
 #include "voromesh/canvas.h"
 #include "voromesh/cpu_voro_optimizer.h"
+#include "voromesh/jolt_executor.h"
 #include "voromesh/shape2d.h"
 #include "voromesh/voro_optimizer.h"
+
+#include <Jolt/Jolt.h>
+
+#include <Jolt/Core/Factory.h>
+#include <Jolt/Core/JobSystemThreadPool.h>
+#include <Jolt/Physics/PhysicsSettings.h> // cMaxPhysicsJobs / cMaxPhysicsBarriers
+#include <Jolt/RegisterTypes.h>
 
 #include <GLFW/glfw3.h> // also pulls in the system GL 1.1 header
 
@@ -66,6 +79,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <type_traits>
 #include <vector>
 
 #ifndef GL_MULTISAMPLE
@@ -206,6 +221,13 @@ public:
     int                              LocalIterations() const { return mLocalIterations; }
     void                             SetLocalIterations(int n) { mLocalIterations = n; }
 
+    /// Parallel loops for the CPU backend (the GPU backend ignores it).
+    void SetExecutor(voromesh::Executor *exec)
+    {
+        if constexpr (std::is_same_v<Backend, CpuBackend>)
+            mOpt.SetExecutor(exec);
+    }
+
 private:
     const Vec2 *Slots() const { return reinterpret_cast<const Vec2 *>(mSampler->Cells().data()); }
 
@@ -327,6 +349,7 @@ struct Input
     bool   toggleEdges = false;
     bool   toggleGens  = false;
     bool   toggleTgts  = false;
+    bool   toggleParallel = false;
     int    brushStep   = 0;
     int    iterStep    = 0;
     double scroll      = 0.0;
@@ -344,6 +367,7 @@ void KeyCallback(GLFWwindow *window, int key, int, int action, int)
     case GLFW_KEY_V:             in->toggleEdges = true; break;
     case GLFW_KEY_G:             in->toggleGens = true; break;
     case GLFW_KEY_T:             in->toggleTgts = true; break;
+    case GLFW_KEY_P:             in->toggleParallel = true; break;
     case GLFW_KEY_RIGHT_BRACKET: in->brushStep = +1; break;
     case GLFW_KEY_LEFT_BRACKET:  in->brushStep = -1; break;
     case GLFW_KEY_EQUAL:         in->iterStep = +1; break;
@@ -441,7 +465,26 @@ struct Options
     int                       raster = 1024;
     voromesh::OptimizerParams params;
     std::string               shot;
-    bool                      cpu = false;
+    bool                      cpu     = false;
+    int                       threads = 0; // 0 = all hardware threads
+};
+
+// Jolt's global state. Only the job system is used so far; the factory and
+// type registration are what shape creation (convex hulls) will need.
+struct JoltRuntime
+{
+    JoltRuntime()
+    {
+        JPH::RegisterDefaultAllocator();
+        JPH::Factory::sInstance = new JPH::Factory();
+        JPH::RegisterTypes();
+    }
+    ~JoltRuntime()
+    {
+        JPH::UnregisterTypes();
+        delete JPH::Factory::sInstance;
+        JPH::Factory::sInstance = nullptr;
+    }
 };
 
 template <class Backend>
@@ -453,11 +496,27 @@ int Run(const Options &opt)
     const std::string               &shot   = opt.shot;
     float voxel = kDomain / raster;
 
+    // One pool for everything: topology runs between physics updates, so the
+    // workers physics uses are idle then. Workers + the calling thread = threads.
+    JoltRuntime jolt;
+    int         threads = opt.threads > 0 ? opt.threads : int(std::max(1u, std::thread::hardware_concurrency()));
+    std::unique_ptr<JPH::JobSystemThreadPool> pool;
+    std::unique_ptr<voromesh::JoltExecutor>   exec;
+    if (threads > 1) {
+        pool = std::make_unique<JPH::JobSystemThreadPool>(JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, threads - 1);
+        exec = std::make_unique<voromesh::JoltExecutor>(*pool);
+    }
+    bool parallel = exec != nullptr;
+
     Editor<Backend> editor(radius, voxel, params);
+    editor.SetExecutor(exec.get());
     unsigned        seed     = 1;
     auto            r0       = Clock::now();
     float           globalMs = editor.Reset(seed);
-    std::printf("Backend: %s\n", Backend::kName);
+    std::printf("Backend: %s, %s\n", Backend::kName,
+                !std::is_same_v<Backend, CpuBackend> ? "CUDA"
+                : parallel ? (std::to_string(threads) + " threads (Jolt JobSystemThreadPool)").c_str()
+                           : "serial");
     std::printf("Canvas %d x %d (voxel %.3f), Poisson r = %.1f -> %d x %d generator slots\n", raster, raster, voxel,
                 radius, editor.Sampler().GridW(), editor.Sampler().GridH());
     std::printf("Reset + global optimisation (%d it): %.3f ms optimise, %.3f ms wall\n", params.iterations,
@@ -672,6 +731,12 @@ int Run(const Options &opt)
         if (input.toggleEdges) { showEdges = !showEdges;     input.toggleEdges = false; }
         if (input.toggleGens)  { showGens = !showGens;       input.toggleGens = false; }
         if (input.toggleTgts)  { showSurface = !showSurface; input.toggleTgts = false; }
+        if (input.toggleParallel) {
+            parallel = exec && !parallel;
+            editor.SetExecutor(parallel ? exec.get() : nullptr);
+            std::printf("Parallel loops: %s\n", parallel ? "on" : "off");
+            input.toggleParallel = false;
+        }
 
         int winW, winH, fbW, fbH;
         glfwGetWindowSize(window, &winW, &winH);
@@ -719,10 +784,11 @@ int Run(const Options &opt)
             const voromesh::VoroMesh2D &mesh = editor.Mesh();
             char title[384];
             std::snprintf(title, sizeof(title),
-                          "VoroMesh 2D [%s] | brush %.0f | opt %d it | last edit %.2f ms (canvas %.2f, in %.2f, "
+                          "VoroMesh 2D [%s, %s] | brush %.0f | opt %d it | last edit %.2f ms (canvas %.2f, in %.2f, "
                           "poisson %.2f, opt %.2f, extract %.2f) | %zu edits | %d shell / %d band cells | %s, "
                           "%d loop(s) | %.0f fps",
-                          Backend::kName, brush, editor.LocalIterations(), last.totalMs, last.canvasMs, last.uploadMs,
+                          Backend::kName, parallel ? (std::to_string(threads) + " threads").c_str() : "serial", brush,
+                          editor.LocalIterations(), last.totalMs, last.canvasMs, last.uploadMs,
                           last.poissonMs, last.optimizeMs, last.extractMs, stats.edits.size(), mesh.shellCells,
                           mesh.bandCells, mesh.watertight ? "watertight" : "NOT WATERTIGHT", mesh.loops, fps);
             glfwSetWindowTitle(window, title);
@@ -744,6 +810,8 @@ Options ParseOptions(int argc, char **argv)
             opt.shot = argv[++i];
         else if (!std::strcmp(argv[i], "--cpu"))
             opt.cpu = true;
+        else if (!std::strcmp(argv[i], "--threads") && i + 1 < argc)
+            opt.threads = std::atoi(argv[++i]);
         else
             pos.push_back(argv[i]);
     }

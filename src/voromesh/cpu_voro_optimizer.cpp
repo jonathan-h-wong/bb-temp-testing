@@ -18,6 +18,15 @@ namespace {
 constexpr int kLossK = 12; // neighbours per target point (paper: 16 in 3D)
 constexpr int kCellK = 32; // neighbours tried per cell before the brute-force fallback
 
+// Parallel grain. Chunking depends only on the work size, never on the thread
+// count, so results are identical for any executor. Loss chunks hold at least
+// kMinTargetsPerChunk targets (~6 sampled, a few us), and there are at most
+// kMaxLossChunks of them because each one adds a gradient buffer to the serial
+// reduction. An extraction chunk is up to 64 cells to classify and maybe clip.
+constexpr size_t kMinTargetsPerChunk = 32;
+constexpr size_t kMaxLossChunks      = 32;
+constexpr size_t kSlotsPerChunk      = 64;
+
 // kNN grid cell size in generator spacings. Ring search pays per cell visited,
 // so cells holding a few generators each beat one-generator cells.
 constexpr float kGridCellScale = 2.0f;
@@ -308,7 +317,6 @@ void CpuVoroOptimizer::SetGenerators(const Vec2 *slots, int slotsW, int slotsH, 
     mGen.assign(slots, slots + n);
     mM.assign(n, Vec2{0, 0});
     mV.assign(n, Vec2{0, 0});
-    mGrad.assign(n, Vec2{0, 0});
     mCellsValid = false;
     BeginSchedule(mParams.iterations);
 }
@@ -349,16 +357,16 @@ void CpuVoroOptimizer::BeginSchedule(int iterations, int cx0, int cy0, int cx1, 
     // Split live generators into active (reset Adam) and frozen (binned once).
     int              n = NumSlots();
     std::vector<int> frozen;
-    mActive.assign(n, 0);
+    mActiveLocal.assign(n, -1);
     mActiveSlots.clear();
     for (int i = 0; i < n; ++i) {
         if (mGen[i].x < 0.0f)
             continue;
         int sx = i % mSlotsW, sy = i / mSlotsW;
         if (sx >= cx0 && sx < cx1 && sy >= cy0 && sy < cy1) {
-            mActive[i] = 1;
+            mActiveLocal[i] = (int)mActiveSlots.size();
             mActiveSlots.push_back(i);
-            mM[i] = mV[i] = mGrad[i] = Vec2{0, 0};
+            mM[i] = mV[i] = Vec2{0, 0};
         } else {
             frozen.push_back(i);
         }
@@ -375,6 +383,11 @@ void CpuVoroOptimizer::BeginSchedule(int iterations, int cx0, int cy0, int cx1, 
         if (p.x >= 0.0f && p.x >= bx0 && p.x <= bx1 && p.y >= by0 && p.y <= by1)
             mActiveTargets.push_back(t);
     }
+    mTargetsPerChunk = std::max(kMinTargetsPerChunk, (mActiveTargets.size() + kMaxLossChunks - 1) / kMaxLossChunks);
+    int chunks       = int((mActiveTargets.size() + mTargetsPerChunk - 1) / mTargetsPerChunk);
+    mChunkGrad.assign(size_t(chunks) * mActiveSlots.size(), Vec2{0, 0});
+    mChunkLoss.assign(chunks, 0.0f);
+    mChunkCount.assign(chunks, 0);
 
     MarkDirty(cx0 * mSlotCellSize, cy0 * mSlotCellSize, cx1 * mSlotCellSize, cy1 * mSlotCellSize);
     mScheduleLength = iterations;
@@ -382,17 +395,21 @@ void CpuVoroOptimizer::BeginSchedule(int iterations, int cx0, int cy0, int cx1, 
     mLastBatchLoss  = 0.0f;
 }
 
-// One VoroLoss + Adam step: the ports of vorolossKernel and adamKernel.
-void CpuVoroOptimizer::StepOnce()
+// VoroLoss and its gradient (port of vorolossKernel) for one chunk of the
+// active targets. Gradients go to the chunk's own buffer, so chunks can run
+// concurrently; frozen generators ignore theirs.
+void CpuVoroOptimizer::LossChunk(int chunk, int iteration)
 {
-    int t = ++mIteration;
-    mActiveGrid.Build(mActiveSlots, mGen, kGridCellScale * mSpacing);
-
-    const float frac = mParams.sampleFraction;
-    float       lossSum = 0.0f;
-    int         count   = 0;
-    for (int ti : mActiveTargets) {
-        if (frac < 1.0f && Rand01(unsigned(ti), unsigned(t), mParams.seed) >= frac)
+    const size_t A     = mActiveSlots.size();
+    Vec2        *grad  = mChunkGrad.data() + size_t(chunk) * A;
+    const float  frac  = mParams.sampleFraction;
+    const size_t begin = size_t(chunk) * mTargetsPerChunk;
+    const size_t end   = std::min(begin + mTargetsPerChunk, mActiveTargets.size());
+    float        lossSum = 0.0f;
+    int          count   = 0;
+    for (size_t a = begin; a < end; ++a) {
+        int ti = mActiveTargets[a];
+        if (frac < 1.0f && Rand01(unsigned(ti), unsigned(iteration), mParams.seed) >= frac)
             continue;
         Vec2        p = mTargets[ti];
         Knn<kLossK> knn;
@@ -426,35 +443,66 @@ void CpuVoroOptimizer::StepOnce()
         lossSum += best;
         ++count;
 
-        // Gradient (see vorolossKernel); frozen generators ignore theirs.
         Vec2  e{mGen[bestJ].x - c0.x, mGen[bestJ].y - c0.y};
         float l = std::sqrt(Dot(e, e));
         Vec2  n{e.x / l, e.y / l};
         float un = Dot(u, n);
         Vec2  dcj{(u.x - un * n.x) / l - 0.5f * n.x, (u.y - un * n.y) / l - 0.5f * n.y};
         float s = 2.0f * bestD;
-        if (mActive[bestJ]) {
-            mGrad[bestJ].x += s * dcj.x;
-            mGrad[bestJ].y += s * dcj.y;
+        if (int lj = mActiveLocal[bestJ]; lj >= 0) {
+            grad[lj].x += s * dcj.x;
+            grad[lj].y += s * dcj.y;
         }
-        if (mActive[i0]) {
-            mGrad[i0].x -= s * (n.x + dcj.x);
-            mGrad[i0].y -= s * (n.y + dcj.y);
+        if (int l0 = mActiveLocal[i0]; l0 >= 0) {
+            grad[l0].x -= s * (n.x + dcj.x);
+            grad[l0].y -= s * (n.y + dcj.y);
         }
+    }
+    mChunkLoss[chunk]  = lossSum;
+    mChunkCount[chunk] = count;
+}
+
+// Serial start of an iteration: re-bin the active generators.
+void CpuVoroOptimizer::BeginIteration()
+{
+    ++mIteration;
+    mActiveGrid.Build(mActiveSlots, mGen, kGridCellScale * mSpacing);
+}
+
+// Serial end of an iteration: sum the loss chunks in chunk order, then Adam
+// (port of adamKernel).
+void CpuVoroOptimizer::FinishIteration()
+{
+    const int t      = mIteration;
+    const int chunks = (int)mChunkLoss.size();
+    float lossSum = 0.0f;
+    int   count   = 0;
+    for (int c = 0; c < chunks; ++c) {
+        lossSum += mChunkLoss[c];
+        count += mChunkCount[c];
     }
     mLastBatchLoss = count > 0 ? lossSum / count : 0.0f;
 
     // Adam + MultiStepLR + clamp.
-    const float b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
-    float       lr = mLr;
+    const float  b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
+    const size_t A  = mActiveSlots.size();
+    float        lr = mLr;
     for (int k = 0; k < 4; ++k)
         if (t - 1 >= mMilestones[k])
             lr *= mParams.gamma;
     float bc1 = 1.0f - std::pow(b1, float(t)), bc2 = 1.0f - std::pow(b2, float(t));
     float inv = 1.0f / float(std::max(count, 1));
-    for (int i : mActiveSlots) {
-        Vec2 g{mGrad[i].x * inv, mGrad[i].y * inv};
-        mGrad[i] = Vec2{0, 0};
+    for (size_t a = 0; a < A; ++a) {
+        Vec2 g{0.0f, 0.0f};
+        for (int c = 0; c < chunks; ++c) {
+            Vec2 &cg = mChunkGrad[size_t(c) * A + a];
+            g.x += cg.x;
+            g.y += cg.y;
+            cg = Vec2{0.0f, 0.0f};
+        }
+        g.x *= inv;
+        g.y *= inv;
+        int   i = mActiveSlots[a];
         Vec2 &m = mM[i], &v = mV[i], &p = mGen[i];
         m.x = b1 * m.x + (1.0f - b1) * g.x;
         m.y = b1 * m.y + (1.0f - b1) * g.y;
@@ -472,8 +520,10 @@ float CpuVoroOptimizer::Step(int iterations)
     if (iterations <= 0 || NumSlots() == 0)
         return 0.0f;
     auto t0 = std::chrono::steady_clock::now();
-    for (int k = 0; k < iterations; ++k)
-        StepOnce();
+    // Each iteration is one round: re-bin, loss chunks in parallel, Adam.
+    RunRounds(
+        mExec, iterations, (int)mChunkLoss.size(), [this](int) { BeginIteration(); },
+        [this](int, int c) { LossChunk(c, mIteration); }, [this](int) { FinishIteration(); });
     return std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
@@ -614,31 +664,16 @@ VoroMesh2D CpuVoroOptimizer::Extract()
             mLive.push_back(i);
     mAllGrid.Build(mLive, mGen, kGridCellScale * mSpacing);
 
-    // Band cells are clipped; deep cells only take their canvas label.
-    int              unsafe = 0, overflow = 0, clipped = 0, promoted = 0;
-    std::vector<int> band; // cells clipped in this pass
-    auto process = [&](int i) {
-        Cell &c   = mCells[i];
-        int   cls = mGen[i].x < 0.0f ? 0 : Classify(mGen[i]);
-        if (cls < 0) {
-            ClipCell(i, mAllGrid, unsafe, overflow);
-            ++clipped;
-            band.push_back(i);
-        } else {
-            c.n      = 0;
-            c.band   = 0;
-            c.inside = uint8_t(cls);
-        }
-    };
-
     // A cell only depends on generators within twice its radius (about a
     // spacing here), and the band test looks kBandSpacings around each
     // generator, so re-processing everything within four spacings of the
     // changes is conservative.
+    std::vector<int> todo;
     if (!mCellsValid) {
         mCells.assign(n, Cell{});
+        todo.resize(n);
         for (int i = 0; i < n; ++i)
-            process(i);
+            todo[i] = i;
     } else if (mDirty) {
         float m  = 4.0f * mSpacing;
         float x0 = mDirtyBox[0] - m, y0 = mDirtyBox[1] - m, x1 = mDirtyBox[2] + m, y1 = mDirtyBox[3] + m;
@@ -646,8 +681,44 @@ VoroMesh2D CpuVoroOptimizer::Extract()
         for (int i = 0; i < n; ++i) {
             float ox = (i % mSlotsW + 0.5f) * mSlotCellSize, oy = (i / mSlotsW + 0.5f) * mSlotCellSize;
             if (in(ox, oy) || (mGen[i].x >= 0.0f && in(mGen[i].x, mGen[i].y)))
-                process(i);
+                todo.push_back(i);
         }
+    }
+
+    // Band cells are clipped; deep cells only take their canvas label. Each
+    // chunk writes only its own cells and counters; results merge in order.
+    struct ChunkOut
+    {
+        int              unsafe = 0, overflow = 0, clipped = 0;
+        std::vector<int> band;
+    };
+    int                   chunks = int((todo.size() + kSlotsPerChunk - 1) / kSlotsPerChunk);
+    std::vector<ChunkOut> outs(chunks);
+    RunTasks(mExec, chunks, [&](int c) {
+        ChunkOut    &out = outs[c];
+        const size_t end = std::min(todo.size(), size_t(c + 1) * kSlotsPerChunk);
+        for (size_t k = size_t(c) * kSlotsPerChunk; k < end; ++k) {
+            int   i    = todo[k];
+            Cell &cell = mCells[i];
+            int   cls  = mGen[i].x < 0.0f ? 0 : Classify(mGen[i]);
+            if (cls < 0) {
+                ClipCell(i, mAllGrid, out.unsafe, out.overflow);
+                ++out.clipped;
+                out.band.push_back(i);
+            } else {
+                cell.n      = 0;
+                cell.band   = 0;
+                cell.inside = uint8_t(cls);
+            }
+        }
+    });
+    int              unsafe = 0, overflow = 0, clipped = 0, promoted = 0;
+    std::vector<int> band; // cells clipped in this pass
+    for (const ChunkOut &out : outs) {
+        unsafe += out.unsafe;
+        overflow += out.overflow;
+        clipped += out.clipped;
+        band.insert(band.end(), out.band.begin(), out.band.end());
     }
 
     // A deep neighbour with the opposite label touches the surface after all

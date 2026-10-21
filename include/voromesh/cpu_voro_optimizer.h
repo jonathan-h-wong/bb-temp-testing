@@ -1,7 +1,7 @@
 #pragma once
 
 // ---------------------------------------------------------------------------
-// cpu_voro_optimizer.h – single-threaded CPU twin of VoroOptimizer.
+// cpu_voro_optimizer.h – CPU twin of VoroOptimizer, optionally parallel.
 //
 // Same algorithm, data layout and API (slots, x < 0 = empty; VoroLoss + Adam
 // with the MultiStepLR schedule; bisector clipping with generator-triple
@@ -18,8 +18,13 @@
 //     label and gets no polygon. Every clipped polygon then checks its
 //     neighbours; a deep neighbour with the opposite label touches the
 //     surface after all and is clipped too, so the boundary stays exact.
+//   * With an Executor (parallel.h), each iteration's loss/gradient pass and
+//     the band classification + clipping of Extract() run as fixed-size
+//     chunks on it. Each loss chunk accumulates its own gradients; chunks are
+//     summed in order, so results do not depend on the thread count.
 // "Uploads" are plain copies into the optimiser's own arrays.
 // ---------------------------------------------------------------------------
+#include "voromesh/parallel.h"
 #include "voromesh/voro_optimizer.h" // OptimizerParams, VoroMesh2D
 
 #include <cstdint>
@@ -31,6 +36,11 @@ class CpuVoroOptimizer
 {
 public:
     CpuVoroOptimizer(float width, float height, float spacing, const OptimizerParams &params = {});
+
+    /// Runs the parallel loops on `exec` (not owned; nullptr = serial). It is
+    /// only used inside Step(), Optimize() and Extract().
+    void      SetExecutor(Executor *exec) { mExec = exec; }
+    Executor *GetExecutor() const { return mExec; }
 
     void SetTargets(const std::vector<Vec2> &slots);
     void UpdateTargets(const std::vector<int> &dirty, const std::vector<Vec2> &slots);
@@ -91,7 +101,9 @@ private:
     template <int K> struct Knn;
     template <int K> void Search(const PointGrid &g, Vec2 q, Knn<K> &knn) const;
 
-    void StepOnce();
+    void BeginIteration();
+    void FinishIteration();
+    void LossChunk(int chunk, int iteration);
     void ClipCell(int i, const PointGrid &all, int &unsafe, int &overflow);
     bool Occupied(Vec2 p) const;
     int  Classify(Vec2 g) const; // 0 deep outside, 1 deep inside, -1 surface band
@@ -109,17 +121,24 @@ private:
 
     int               mSlotsW = 0, mSlotsH = 0;
     float             mSlotCellSize = 1.0f;
-    std::vector<Vec2> mGen, mM, mV, mGrad;
+    std::vector<Vec2> mGen, mM, mV;
+    Executor         *mExec = nullptr;
 
     // Current schedule
     int                  mIteration = 0, mScheduleLength = 0;
     float                mLr = 0.0f;
     int                  mMilestones[4] = {};
-    std::vector<uint8_t> mActive;        // per slot
+    std::vector<int>     mActiveLocal;   // per slot: index into mActiveSlots, -1 if frozen
     std::vector<int>     mActiveSlots;   // live slots that move
     std::vector<int>     mActiveTargets; // targets near the active rectangle
     PointGrid            mFrozenGrid, mActiveGrid;
     float                mLastBatchLoss = 0.0f;
+
+    // Loss chunks: chunk c covers mActiveTargets[c * mTargetsPerChunk, ...).
+    size_t             mTargetsPerChunk = 1;
+    std::vector<Vec2>  mChunkGrad;  // numChunks x mActiveSlots.size()
+    std::vector<float> mChunkLoss;
+    std::vector<int>   mChunkCount;
 
     // Persistent extraction state
     std::vector<Cell> mCells;
