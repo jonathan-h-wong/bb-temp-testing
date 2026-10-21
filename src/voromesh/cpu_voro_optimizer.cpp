@@ -240,6 +240,8 @@ void CpuVoroOptimizer::SetOccupancy(const std::vector<uint64_t> &masks, int tile
     mVoxelSize  = voxelSize;
     mInvVoxel   = 1.0f / voxelSize;
     mCellsValid = false;
+    mTileClass.resize(size_t(tilesX) * tilesY);
+    UpdateTileClass(0, 0, tilesX, tilesY);
 }
 
 void CpuVoroOptimizer::UpdateOccupancy(const std::vector<uint64_t> &masks, int tx0, int ty0, int tx1, int ty1)
@@ -249,8 +251,41 @@ void CpuVoroOptimizer::UpdateOccupancy(const std::vector<uint64_t> &masks, int t
     for (int ty = ty0; ty < ty1; ++ty)
         for (int tx = tx0; tx < tx1; ++tx)
             mOccupancy[size_t(ty) * mTilesX + tx] = masks[size_t(ty) * mTilesX + tx];
+    UpdateTileClass(tx0, ty0, tx1, ty1);
     float tile = 8.0f * mVoxelSize;
     MarkDirty(tx0 * tile, ty0 * tile, tx1 * tile, ty1 * tile);
+}
+
+void CpuVoroOptimizer::UpdateTileClass(int tx0, int ty0, int tx1, int ty1)
+{
+    for (int ty = ty0; ty < ty1; ++ty)
+        for (int tx = tx0; tx < tx1; ++tx) {
+            uint64_t w = mOccupancy[size_t(ty) * mTilesX + tx];
+            mTileClass[size_t(ty) * mTilesX + tx] = w == 0 ? 0 : w == ~uint64_t(0) ? 1 : 2;
+        }
+}
+
+// Deep if every canvas tile overlapping the square of half-width
+// kBandSpacings * spacing around g has the same uniform label (tiles outside
+// the domain count as outside). Whole tiles make the window slightly larger,
+// which only errs towards the band.
+int CpuVoroOptimizer::Classify(Vec2 g) const
+{
+    float d   = kBandSpacings * mSpacing;
+    int   tx0 = int(std::floor((g.x - d) * mInvVoxel)) >> 3, tx1 = int(std::floor((g.x + d) * mInvVoxel)) >> 3;
+    int   ty0 = int(std::floor((g.y - d) * mInvVoxel)) >> 3, ty1 = int(std::floor((g.y + d) * mInvVoxel)) >> 3;
+    int   cls = -1;
+    for (int ty = ty0; ty <= ty1; ++ty)
+        for (int tx = tx0; tx <= tx1; ++tx) {
+            int c = (tx < 0 || ty < 0 || tx >= mTilesX || ty >= mTilesY) ? 0 : mTileClass[size_t(ty) * mTilesX + tx];
+            if (c == 2)
+                return -1;
+            if (cls < 0)
+                cls = c;
+            else if (c != cls)
+                return -1;
+        }
+    return cls;
 }
 
 bool CpuVoroOptimizer::Occupied(Vec2 p) const
@@ -492,6 +527,7 @@ void CpuVoroOptimizer::ClipCell(int i, const PointGrid &all, int &unsafe, int &o
     if (ci.x < 0.0f) {
         cell.n      = 0;
         cell.inside = 0;
+        cell.band   = 0;
         return;
     }
 
@@ -556,6 +592,7 @@ void CpuVoroOptimizer::ClipCell(int i, const PointGrid &all, int &unsafe, int &o
     }
 
     cell.inside = Occupied(centroid) ? 1 : 0;
+    cell.band   = 1;
     cell.n      = poly.n;
     for (int k = 0; k < poly.n; ++k) {
         cell.v[k] = Vec2{float(ci.x + poly.v[k].x), float(ci.y + poly.v[k].y)};
@@ -577,32 +614,64 @@ VoroMesh2D CpuVoroOptimizer::Extract()
             mLive.push_back(i);
     mAllGrid.Build(mLive, mGen, kGridCellScale * mSpacing);
 
-    // A cell only depends on generators within twice its radius, and cells
-    // here are about one spacing across, so re-clipping everything within
-    // four spacings of the changes is conservative.
-    int unsafe = 0, overflow = 0, clipped = 0;
+    // Band cells are clipped; deep cells only take their canvas label.
+    int              unsafe = 0, overflow = 0, clipped = 0, promoted = 0;
+    std::vector<int> band; // cells clipped in this pass
+    auto process = [&](int i) {
+        Cell &c   = mCells[i];
+        int   cls = mGen[i].x < 0.0f ? 0 : Classify(mGen[i]);
+        if (cls < 0) {
+            ClipCell(i, mAllGrid, unsafe, overflow);
+            ++clipped;
+            band.push_back(i);
+        } else {
+            c.n      = 0;
+            c.band   = 0;
+            c.inside = uint8_t(cls);
+        }
+    };
+
+    // A cell only depends on generators within twice its radius (about a
+    // spacing here), and the band test looks kBandSpacings around each
+    // generator, so re-processing everything within four spacings of the
+    // changes is conservative.
     if (!mCellsValid) {
         mCells.assign(n, Cell{});
         for (int i = 0; i < n; ++i)
-            ClipCell(i, mAllGrid, unsafe, overflow);
-        clipped = n;
+            process(i);
     } else if (mDirty) {
         float m  = 4.0f * mSpacing;
         float x0 = mDirtyBox[0] - m, y0 = mDirtyBox[1] - m, x1 = mDirtyBox[2] + m, y1 = mDirtyBox[3] + m;
         auto  in = [&](float x, float y) { return x >= x0 && x <= x1 && y >= y0 && y <= y1; };
         for (int i = 0; i < n; ++i) {
             float ox = (i % mSlotsW + 0.5f) * mSlotCellSize, oy = (i / mSlotsW + 0.5f) * mSlotCellSize;
-            if (in(ox, oy) || (mGen[i].x >= 0.0f && in(mGen[i].x, mGen[i].y))) {
-                ClipCell(i, mAllGrid, unsafe, overflow);
-                ++clipped;
-            }
+            if (in(ox, oy) || (mGen[i].x >= 0.0f && in(mGen[i].x, mGen[i].y)))
+                process(i);
         }
     }
+
+    // A deep neighbour with the opposite label touches the surface after all
+    // (its cell is wider than the band test assumed): clip it too, and check
+    // its neighbours in turn.
+    for (size_t w = 0; w < band.size(); ++w) {
+        int i = band[w];
+        for (int k = 0; k < mCells[i].n; ++k) {
+            int j = mCells[i].e[k];
+            if (j < 0 || mCells[j].band || mCells[j].inside == mCells[i].inside)
+                continue;
+            ClipCell(j, mAllGrid, unsafe, overflow);
+            ++clipped;
+            ++promoted;
+            band.push_back(j);
+        }
+    }
+
     mCellsValid        = true;
     mDirty             = false;
     mesh.unsafeCells   = unsafe;
     mesh.overflowCells = overflow;
     mesh.clippedCells  = clipped;
+    mesh.promotedCells = promoted;
     auto t1            = std::chrono::steady_clock::now();
 
     mesh.generators = mGen;

@@ -45,10 +45,12 @@ struct OptimizerParams
 
 struct VoroMesh2D
 {
-    // Full Voronoi diagram clipped to the domain: one convex polygon per
-    // generator slot (empty slots have an empty polygon and x < 0).
+    // Voronoi cells clipped to the domain: one convex polygon per generator
+    // slot. Empty slots (x < 0) have no polygon, and on the CPU path neither do
+    // cells outside the surface band, whose occupancy comes from the canvas.
     std::vector<Vec2>    generators;
     std::vector<uint8_t> inside;    // occupancy: cell centroid inside the canvas shape
+    std::vector<uint8_t> shell;     // inside cells with an edge on the boundary (the collision shell)
     std::vector<int>     cellStart; // CSR offsets into cellVerts, size generators + 1
     std::vector<Vec2>    cellVerts;
 
@@ -65,6 +67,9 @@ struct VoroMesh2D
     int   overflowCells = 0;     // cells that exceeded the fixed vertex budget (should stay 0)
     float cellsMs       = 0.0f;  // hash grid + cell clipping + occupancy (GPU time on the GPU path)
     int   clippedCells  = 0;     // cells (re)computed by this extraction
+    int   bandCells     = 0;     // cells with a polygon (GPU path: every live cell)
+    int   shellCells    = 0;
+    int   promotedCells = 0;     // band cells found by the neighbour-label check, not the canvas test
     float assemblyMs    = 0.0f;  // download (GPU path) + boundary assembly
 };
 

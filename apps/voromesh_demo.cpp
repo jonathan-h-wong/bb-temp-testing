@@ -19,14 +19,19 @@
 //   4. Re-optimise only those generators.
 //   5. Extract and re-render.
 //
+// Drawn: the interior bounded by the Voronoi boundary (stencil fill, so holes
+// work), the shell cells (inside cells on the boundary: the future convex
+// collision pieces) and their generators, the surface-band cell edges, the
+// boundary itself, and the canvas surface points.
+//
 // Controls
 //   Left drag     carve (disc -> outside)
 //   Right drag    add (disc -> inside)
 //   Wheel / [ ]   brush radius
 //   - / =         fewer / more optimisation steps per stamp (0 shows the raw reseed)
 //   R             reset to the heart (global optimisation)
-//   F / V         toggle cell fill / Voronoi edges
-//   G / T         toggle generators / canvas surface points
+//   F / V         toggle fill (interior + shell cells) / surface-band cell edges
+//   G / T         toggle shell generators / canvas surface points
 //   Esc           quit (prints edit timing statistics)
 //
 // Usage: voromesh_demo [radius=24] [raster=1024] [localIterations=100] [--cpu] [--shot prefix]
@@ -272,6 +277,8 @@ void PrintMesh(const char *label, EditorT &editor)
     std::printf("  VoroLoss (all targets)   %.4f  (RMS %.3f voxels)\n", loss, std::sqrt(loss) / voxel);
     std::printf("  cells                    %d live of %zu slots (%d inside), unsafe %d, overflow %d\n", live,
                 mesh.generators.size(), inside, mesh.unsafeCells, mesh.overflowCells);
+    std::printf("  surface band             %d cells with polygons, %d shell cells, %d promoted last pass\n",
+                mesh.bandCells, mesh.shellCells, mesh.promotedCells);
     std::printf("  boundary                 %zu vertices, %zu edges, %d loop(s), %s\n", mesh.vertices.size(),
                 mesh.edges.size(), mesh.loops, mesh.watertight ? "WATERTIGHT" : "NOT WATERTIGHT");
     std::printf("  surface -> mesh          mean %.3f  max %.3f voxels\n", acc.meanToMesh / voxel,
@@ -353,32 +360,35 @@ void ScrollCallback(GLFWwindow *window, double, double yoff)
 // Triangles/lines for the legacy-GL renderer, rebuilt whenever the mesh changes.
 struct DrawBuffers
 {
-    std::vector<float> insideTris, outsideTris, cellLines, boundaryLines, generators, surface;
+    std::vector<float> interiorFan, shellTris, cellLines, boundaryLines, generators, surface;
 
     void Build(const voromesh::VoroMesh2D &mesh, const std::vector<Vec2> &surfacePoints)
     {
-        insideTris.clear();
-        outsideTris.clear();
+        interiorFan.clear();
+        shellTris.clear();
         cellLines.clear();
         boundaryLines.clear();
         generators.clear();
         surface.clear();
         for (size_t i = 0; i + 1 < mesh.cellStart.size(); ++i) {
-            int                 s = mesh.cellStart[i], n = mesh.cellStart[i + 1] - s;
-            const Vec2         *v = mesh.cellVerts.data() + s;
-            std::vector<float> &tris = mesh.inside[i] ? insideTris : outsideTris;
-            for (int k = 1; k + 1 < n; ++k)
-                tris.insert(tris.end(), {v[0].x, v[0].y, v[k].x, v[k].y, v[k + 1].x, v[k + 1].y});
+            int         s = mesh.cellStart[i], n = mesh.cellStart[i + 1] - s;
+            const Vec2 *v = mesh.cellVerts.data() + s;
+            if (mesh.shell[i]) {
+                for (int k = 1; k + 1 < n; ++k)
+                    shellTris.insert(shellTris.end(), {v[0].x, v[0].y, v[k].x, v[k].y, v[k + 1].x, v[k + 1].y});
+                generators.insert(generators.end(), {mesh.generators[i].x, mesh.generators[i].y});
+            }
             for (int k = 0; k < n; ++k)
                 cellLines.insert(cellLines.end(), {v[k].x, v[k].y, v[(k + 1) % n].x, v[(k + 1) % n].y});
         }
+        // The interior is drawn with an even-odd stencil: one triangle from the
+        // origin to every boundary edge covers each interior point an odd
+        // number of times, for any number of loops and holes.
         for (auto [a, b] : mesh.edges) {
             Vec2 p = mesh.vertices[a], q = mesh.vertices[b];
             boundaryLines.insert(boundaryLines.end(), {p.x, p.y, q.x, q.y});
+            interiorFan.insert(interiorFan.end(), {0.0f, 0.0f, p.x, p.y, q.x, q.y});
         }
-        for (Vec2 g : mesh.generators)
-            if (g.x >= 0.0f)
-                generators.insert(generators.end(), {g.x, g.y});
         for (Vec2 p : surfacePoints)
             surface.insert(surface.end(), {p.x, p.y});
     }
@@ -459,6 +469,7 @@ int Run(const Options &opt)
     if (!glfwInit())
         throw std::runtime_error("glfwInit failed");
     glfwWindowHint(GLFW_SAMPLES, 4);
+    glfwWindowHint(GLFW_STENCIL_BITS, 8); // interior fill
     GLFWwindow *window = glfwCreateWindow(900, 900, "VoroMesh 2D", nullptr, nullptr);
     if (!window) {
         glfwTerminate();
@@ -509,10 +520,23 @@ int Run(const Options &opt)
         glEnableClientState(GL_VERTEX_ARRAY);
 
         if (showFill) {
-            glColor4f(0.12f, 0.13f, 0.16f, 1.0f);
-            DrawArray(draw.outsideTris, GL_TRIANGLES);
-            glColor4f(0.55f, 0.16f, 0.24f, 1.0f);
-            DrawArray(draw.insideTris, GL_TRIANGLES);
+            glEnable(GL_STENCIL_TEST);
+            glClear(GL_STENCIL_BUFFER_BIT);
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+            glStencilFunc(GL_ALWAYS, 0, 1);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_INVERT);
+            DrawArray(draw.interiorFan, GL_TRIANGLES);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glStencilFunc(GL_EQUAL, 1, 1);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+            glColor4f(0.30f, 0.10f, 0.15f, 1.0f);
+            const float domain[] = {0, 0, kDomain, 0, kDomain, kDomain, 0, kDomain};
+            glVertexPointer(2, GL_FLOAT, 0, domain);
+            glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+            glDisable(GL_STENCIL_TEST);
+
+            glColor4f(0.62f, 0.18f, 0.27f, 1.0f);
+            DrawArray(draw.shellTris, GL_TRIANGLES);
         }
 
         // Recently re-optimised regions fade out.
@@ -696,10 +720,11 @@ int Run(const Options &opt)
             char title[384];
             std::snprintf(title, sizeof(title),
                           "VoroMesh 2D [%s] | brush %.0f | opt %d it | last edit %.2f ms (canvas %.2f, in %.2f, "
-                          "poisson %.2f, opt %.2f, extract %.2f) | %zu edits | %s, %d loop(s) | %.0f fps",
-                          Backend::kName, brush, editor.LocalIterations(), last.totalMs, last.canvasMs, last.uploadMs, last.poissonMs, last.optimizeMs,
-                          last.extractMs, stats.edits.size(), mesh.watertight ? "watertight" : "NOT WATERTIGHT",
-                          mesh.loops, fps);
+                          "poisson %.2f, opt %.2f, extract %.2f) | %zu edits | %d shell / %d band cells | %s, "
+                          "%d loop(s) | %.0f fps",
+                          Backend::kName, brush, editor.LocalIterations(), last.totalMs, last.canvasMs, last.uploadMs,
+                          last.poissonMs, last.optimizeMs, last.extractMs, stats.edits.size(), mesh.shellCells,
+                          mesh.bandCells, mesh.watertight ? "watertight" : "NOT WATERTIGHT", mesh.loops, fps);
             glfwSetWindowTitle(window, title);
         }
     }

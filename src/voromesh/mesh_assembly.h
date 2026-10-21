@@ -24,10 +24,12 @@ void AssembleMesh(VoroMesh2D &mesh, int n, PolyFn poly)
 {
     // Compact the polygons into CSR.
     mesh.cellStart.assign(n + 1, 0);
+    mesh.bandCells = 0;
     for (int i = 0; i < n; ++i) {
         int c; const Vec2 *v; const int *e;
         poly(i, c, v, e);
         mesh.cellStart[i + 1] = mesh.cellStart[i] + c;
+        mesh.bandCells += c > 0;
     }
     mesh.cellVerts.resize(mesh.cellStart[n]);
     for (int i = 0; i < n; ++i) {
@@ -52,6 +54,8 @@ void AssembleMesh(VoroMesh2D &mesh, int n, PolyFn poly)
         if (inserted) mesh.vertices.push_back(p);
         return it->second;
     };
+    mesh.shell.assign(n, 0);
+    mesh.shellCells = 0;
     for (int i = 0; i < n; ++i) {
         if (!mesh.inside[i]) continue;
         int c; const Vec2 *pos; const int *lab;
@@ -63,6 +67,10 @@ void AssembleMesh(VoroMesh2D &mesh, int n, PolyFn poly)
             int a = vertex(key(i, prev, l), pos[k]);
             int b = vertex(key(i, l, next), pos[(k + 1) % c]);
             mesh.edges.push_back({a, b});
+            if (!mesh.shell[i]) {
+                mesh.shell[i] = 1;
+                ++mesh.shellCells;
+            }
         }
     }
 

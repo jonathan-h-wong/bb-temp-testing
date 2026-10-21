@@ -12,6 +12,12 @@
 //     the active ones are re-binned each iteration.
 //   * Extract() keeps every cell polygon between calls and only re-clips the
 //     cells near what changed since the previous extraction.
+//   * Extract() only clips the surface band. A generator whose surroundings
+//     (kBandSpacings around it) are uniformly inside or outside on the canvas
+//     is "deep": its cell lies on one side of the surface, so it takes that
+//     label and gets no polygon. Every clipped polygon then checks its
+//     neighbours; a deep neighbour with the opposite label touches the
+//     surface after all and is clipped too, so the boundary stays exact.
 // "Uploads" are plain copies into the optimiser's own arrays.
 // ---------------------------------------------------------------------------
 #include "voromesh/voro_optimizer.h" // OptimizerParams, VoroMesh2D
@@ -49,6 +55,9 @@ public:
     /// first time, or after SetGenerators / SetOccupancy).
     VoroMesh2D Extract();
 
+    /// Half-width of the canvas window that decides deep vs. band, in spacings.
+    static constexpr float kBandSpacings = 2.0f;
+
     int                    Iteration() const { return mIteration; }
     int                    ScheduleLength() const { return mScheduleLength; }
     int                    NumSlots() const { return mSlotsW * mSlotsH; }
@@ -74,6 +83,7 @@ private:
     {
         int     n      = 0;
         uint8_t inside = 0;
+        uint8_t band   = 0; // has a polygon
         Vec2    v[kMaxCellVerts];
         int     e[kMaxCellVerts]; // label of edge v[k] -> v[k+1]
     };
@@ -84,6 +94,8 @@ private:
     void StepOnce();
     void ClipCell(int i, const PointGrid &all, int &unsafe, int &overflow);
     bool Occupied(Vec2 p) const;
+    int  Classify(Vec2 g) const; // 0 deep outside, 1 deep inside, -1 surface band
+    void UpdateTileClass(int tx0, int ty0, int tx1, int ty1);
     void MarkDirty(float x0, float y0, float x1, float y1);
 
     float           mWidth, mHeight, mSpacing;
@@ -91,6 +103,7 @@ private:
 
     std::vector<Vec2>     mTargets;
     std::vector<uint64_t> mOccupancy;
+    std::vector<uint8_t>  mTileClass; // per tile: 0 all outside, 1 all inside, 2 mixed
     int                   mTilesX = 0, mTilesY = 0;
     float                 mInvVoxel = 0.0f, mVoxelSize = 1.0f;
 
