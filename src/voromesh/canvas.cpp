@@ -57,14 +57,17 @@ int Canvas::AllocSlot(Vec2 p)
     } else {
         slot = (int)mSlots.size();
         mSlots.push_back({});
+        mSlotLabels.push_back(-1);
     }
-    mSlots[slot] = p;
+    mSlots[slot]      = p;
+    mSlotLabels[slot] = -1;
     return slot;
 }
 
 void Canvas::FreeSlot(int slot)
 {
-    mSlots[slot] = {-1.0f, -1.0f};
+    mSlots[slot]      = {-1.0f, -1.0f};
+    mSlotLabels[slot] = -1;
     mFreeSlots.push_back(slot);
 }
 
@@ -73,6 +76,7 @@ void Canvas::RasterizeShape(const std::vector<Vec2> &polygon)
     mSurface.clear();
     mSurfaceCount = 0;
     mSlots.clear();
+    mSlotLabels.clear();
     mFreeSlots.clear();
     std::fill(mInside.begin(), mInside.end(), 0);
 
@@ -93,7 +97,7 @@ void Canvas::RasterizeShape(const std::vector<Vec2> &polygon)
         }
     }
 
-    // Assign target slots in row-major tile order so the GPU array starts out
+    // Assign target slots in row-major tile order so the target array starts out
     // spatially coherent.
     std::vector<uint64_t> voxels;
     voxels.reserve(accum.size());

@@ -9,10 +9,19 @@
 //     set = voxel centre inside the object (128 KB at 1024^2).
 //   * Surface: a sparse hash map of the tiles the boundary passes through.
 //     Each surface voxel holds the mean of the boundary samples inside it (a
-//     sub-voxel surface point) and the index of the GPU target slot that
-//     mirrors it.
+//     sub-voxel surface point) and its target slot: a stable index into the
+//     flat target array the optimiser fits to.
+// Both are addressed the same way: voxel (i, j) is tile (tx, ty) =
+// (i >> 3, j >> 3), bit Bit(i, j), and
+//   occupancy  mInside[ty * mTilesX + tx] >> bit & 1
+//   surface    mSurface[TileKey(tx, ty)]: .mask >> bit & 1, .points[bit], .slots[bit]
+// They hold independent facts (a surface voxel can be inside or outside), and
+// each edit pass updates one of them.
+// A target slot is a surface point's persistent ID: the point keeps it until
+// it is deleted (a rim sample landing in an existing point's voxel moves that
+// point in place), and freed slots are reused by later points.
 // Edits report the target slots and the occupancy tiles they changed, so only
-// those need to be streamed to the GPU.
+// those need to be copied to the optimiser.
 // ---------------------------------------------------------------------------
 #include "voromesh/shape2d.h"
 
@@ -60,8 +69,12 @@ public:
     bool IsInside(int i, int j) const;
     bool IsSurface(int i, int j) const;
 
-    /// Host mirror of the GPU target array; {-1, -1} marks a free slot.
+    /// The flat target array, indexed by target slot; {-1, -1} marks a free slot.
     const std::vector<Vec2>     &TargetSlots() const { return mSlots; }
+    /// Connected-component label per target slot, -1 for free slots and for
+    /// points not labelled yet (every new point starts at -1).
+    const std::vector<int>      &SlotLabels() const { return mSlotLabels; }
+    void                         SetSlotLabel(int slot, int label) { mSlotLabels[slot] = label; }
     const std::vector<uint64_t> &InsideMasks() const { return mInside; }
 
     int    TilesX() const { return mTilesX; }
@@ -85,6 +98,7 @@ private:
     size_t                                    mSurfaceCount = 0;
 
     std::vector<Vec2> mSlots;
+    std::vector<int>  mSlotLabels; // parallel to mSlots
     std::vector<int>  mFreeSlots;
 };
 

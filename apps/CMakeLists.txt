@@ -19,7 +19,7 @@ add_executable(poisson_demo poisson_demo.cpp)
 
 target_link_libraries(poisson_demo PRIVATE poisson glfw OpenGL::GL)
 
-# 2D VoroMesh of a heart: canvas + VoroLoss optimisation (CUDA or CPU on a Jolt job pool)
+# 2D VoroMesh of a heart: canvas + VoroLoss optimisation on a Jolt job pool
 find_path(STB_INCLUDE_DIRS "stb_image_write.h")
 
 add_executable(voromesh_demo voromesh_demo.cpp)
@@ -28,4 +28,4 @@ target_include_directories(voromesh_demo PRIVATE ${STB_INCLUDE_DIRS})
 
 find_package(Jolt CONFIG REQUIRED)
 
-target_link_libraries(voromesh_demo PRIVATE voromesh poisson glfw OpenGL::GL Jolt::Jolt)
+target_link_libraries(voromesh_demo PRIVATE voromesh poisson_cpu glfw OpenGL::GL Jolt::Jolt)

@@ -1,15 +1,12 @@
-// CPU twin of voro_optimizer.cu. The per-target loss/gradient, Adam step and
-// cell clipping are line-for-line ports of the CUDA kernels; what differs is
-// the bookkeeping that keeps a local edit local (see the header).
+// VoroMesh optimisation and extraction; see voro_optimizer.h for the design.
 
-#include "voromesh/cpu_voro_optimizer.h"
-
-#include "mesh_assembly.h"
+#include "voromesh/voro_optimizer.h"
 
 #include <algorithm>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <unordered_map>
 
 namespace voromesh {
 
@@ -27,11 +24,16 @@ constexpr size_t kMinTargetsPerChunk = 32;
 constexpr size_t kMaxLossChunks      = 32;
 constexpr size_t kSlotsPerChunk      = 64;
 
+// Edge labels: >= 0 is the neighbouring generator slot, -1..-4 the domain box
+// sides. Boundary vertex keys shift them up by kBoxLabels to stay unsigned.
+constexpr int kBoxLabels = 4;
+
 // kNN grid cell size in generator spacings. Ring search pays per cell visited,
 // so cells holding a few generators each beat one-generator cells.
 constexpr float kGridCellScale = 2.0f;
 
-// Same stateless hash as the GPU subsampling, so both paths pick the same targets.
+// Stateless hash: which targets a step subsamples depends only on (target,
+// iteration, seed), never on which thread evaluates them.
 unsigned PcgHash(unsigned v)
 {
     unsigned state = v * 747796405u + 2891336453u;
@@ -54,8 +56,8 @@ struct DVec2
 
 struct Poly
 {
-    DVec2 v[CpuVoroOptimizer::kMaxCellVerts];
-    int   e[CpuVoroOptimizer::kMaxCellVerts];
+    DVec2 v[VoroOptimizer::kMaxCellVerts];
+    int   e[VoroOptimizer::kMaxCellVerts];
     int   n;
 };
 
@@ -74,7 +76,7 @@ bool ClipByBisector(Poly &poly, DVec2 r, int label)
     out.n   = 0;
     bool ok = true;
     auto push = [&](DVec2 v, int e) {
-        if (out.n < CpuVoroOptimizer::kMaxCellVerts) {
+        if (out.n < VoroOptimizer::kMaxCellVerts) {
             out.v[out.n] = v;
             out.e[out.n] = e;
             ++out.n;
@@ -112,7 +114,7 @@ double MaxRadius2(const Poly &poly)
 
 // K nearest generators, sorted by distance. Missing entries get idx -1.
 template <int K>
-struct CpuVoroOptimizer::Knn
+struct VoroOptimizer::Knn
 {
     int   idx[K];
     float d2[K];
@@ -140,7 +142,7 @@ struct CpuVoroOptimizer::Knn
     }
 };
 
-void CpuVoroOptimizer::PointGrid::Build(const std::vector<int> &ids, const std::vector<Vec2> &gen, float cs)
+void VoroOptimizer::PointGrid::Build(const std::vector<int> &ids, const std::vector<Vec2> &gen, float cs)
 {
     cellSize = cs;
     idx.resize(ids.size());
@@ -185,7 +187,7 @@ void CpuVoroOptimizer::PointGrid::Build(const std::vector<int> &ids, const std::
 // searched block. Can be called on several grids in turn: the K-th distance
 // only shrinks, so earlier searches stay valid.
 template <int K>
-void CpuVoroOptimizer::Search(const PointGrid &g, Vec2 q, Knn<K> &knn) const
+void VoroOptimizer::Search(const PointGrid &g, Vec2 q, Knn<K> &knn) const
 {
     if (g.idx.empty())
         return;
@@ -223,7 +225,7 @@ void CpuVoroOptimizer::Search(const PointGrid &g, Vec2 q, Knn<K> &knn) const
     }
 }
 
-CpuVoroOptimizer::CpuVoroOptimizer(float width, float height, float spacing, const OptimizerParams &params)
+VoroOptimizer::VoroOptimizer(float width, float height, float spacing, const OptimizerParams &params)
     : mWidth(width), mHeight(height), mSpacing(spacing), mParams(params)
 {
 }
@@ -231,9 +233,13 @@ CpuVoroOptimizer::CpuVoroOptimizer(float width, float height, float spacing, con
 // ---------------------------------------------------------------------------
 // Inputs
 // ---------------------------------------------------------------------------
-void CpuVoroOptimizer::SetTargets(const std::vector<Vec2> &slots) { mTargets = slots; }
+void VoroOptimizer::SetTargets(const std::vector<Vec2> &slots)
+{
+    mTargets     = slots;
+    mOwnersValid = false;
+}
 
-void CpuVoroOptimizer::UpdateTargets(const std::vector<int> &dirty, const std::vector<Vec2> &slots)
+void VoroOptimizer::UpdateTargets(const std::vector<int> &dirty, const std::vector<Vec2> &slots)
 {
     if (slots.size() > mTargets.size())
         mTargets.resize(slots.size(), Vec2{-1.0f, -1.0f});
@@ -241,7 +247,7 @@ void CpuVoroOptimizer::UpdateTargets(const std::vector<int> &dirty, const std::v
         mTargets[s] = slots[s];
 }
 
-void CpuVoroOptimizer::SetOccupancy(const std::vector<uint64_t> &masks, int tilesX, int tilesY, float voxelSize)
+void VoroOptimizer::SetOccupancy(const std::vector<uint64_t> &masks, int tilesX, int tilesY, float voxelSize)
 {
     mOccupancy  = masks;
     mTilesX     = tilesX;
@@ -253,7 +259,7 @@ void CpuVoroOptimizer::SetOccupancy(const std::vector<uint64_t> &masks, int tile
     UpdateTileClass(0, 0, tilesX, tilesY);
 }
 
-void CpuVoroOptimizer::UpdateOccupancy(const std::vector<uint64_t> &masks, int tx0, int ty0, int tx1, int ty1)
+void VoroOptimizer::UpdateOccupancy(const std::vector<uint64_t> &masks, int tx0, int ty0, int tx1, int ty1)
 {
     tx0 = std::max(tx0, 0), ty0 = std::max(ty0, 0);
     tx1 = std::min(tx1, mTilesX), ty1 = std::min(ty1, mTilesY);
@@ -265,7 +271,7 @@ void CpuVoroOptimizer::UpdateOccupancy(const std::vector<uint64_t> &masks, int t
     MarkDirty(tx0 * tile, ty0 * tile, tx1 * tile, ty1 * tile);
 }
 
-void CpuVoroOptimizer::UpdateTileClass(int tx0, int ty0, int tx1, int ty1)
+void VoroOptimizer::UpdateTileClass(int tx0, int ty0, int tx1, int ty1)
 {
     for (int ty = ty0; ty < ty1; ++ty)
         for (int tx = tx0; tx < tx1; ++tx) {
@@ -278,7 +284,7 @@ void CpuVoroOptimizer::UpdateTileClass(int tx0, int ty0, int tx1, int ty1)
 // kBandSpacings * spacing around g has the same uniform label (tiles outside
 // the domain count as outside). Whole tiles make the window slightly larger,
 // which only errs towards the band.
-int CpuVoroOptimizer::Classify(Vec2 g) const
+int VoroOptimizer::Classify(Vec2 g) const
 {
     float d   = kBandSpacings * mSpacing;
     int   tx0 = int(std::floor((g.x - d) * mInvVoxel)) >> 3, tx1 = int(std::floor((g.x + d) * mInvVoxel)) >> 3;
@@ -297,7 +303,7 @@ int CpuVoroOptimizer::Classify(Vec2 g) const
     return cls;
 }
 
-bool CpuVoroOptimizer::Occupied(Vec2 p) const
+bool VoroOptimizer::Occupied(Vec2 p) const
 {
     int i = int(std::floor(p.x * mInvVoxel)), j = int(std::floor(p.y * mInvVoxel));
     if (i < 0 || j < 0)
@@ -308,7 +314,7 @@ bool CpuVoroOptimizer::Occupied(Vec2 p) const
     return (mOccupancy[size_t(ty) * mTilesX + tx] >> (((j & 7) << 3) | (i & 7))) & 1;
 }
 
-void CpuVoroOptimizer::SetGenerators(const Vec2 *slots, int slotsW, int slotsH, float slotCellSize)
+void VoroOptimizer::SetGenerators(const Vec2 *slots, int slotsW, int slotsH, float slotCellSize)
 {
     int n         = slotsW * slotsH;
     mSlotsW       = slotsW;
@@ -321,7 +327,7 @@ void CpuVoroOptimizer::SetGenerators(const Vec2 *slots, int slotsW, int slotsH, 
     BeginSchedule(mParams.iterations);
 }
 
-void CpuVoroOptimizer::UpdateGenerators(const Vec2 *slots, int cx0, int cy0, int cx1, int cy1)
+void VoroOptimizer::UpdateGenerators(const Vec2 *slots, int cx0, int cy0, int cx1, int cy1)
 {
     cx0 = std::max(cx0, 0), cy0 = std::max(cy0, 0);
     cx1 = std::min(cx1, mSlotsW), cy1 = std::min(cy1, mSlotsH);
@@ -331,7 +337,7 @@ void CpuVoroOptimizer::UpdateGenerators(const Vec2 *slots, int cx0, int cy0, int
     MarkDirty(cx0 * mSlotCellSize, cy0 * mSlotCellSize, cx1 * mSlotCellSize, cy1 * mSlotCellSize);
 }
 
-void CpuVoroOptimizer::MarkDirty(float x0, float y0, float x1, float y1)
+void VoroOptimizer::MarkDirty(float x0, float y0, float x1, float y1)
 {
     if (!mDirty) {
         mDirtyBox[0] = x0, mDirtyBox[1] = y0, mDirtyBox[2] = x1, mDirtyBox[3] = y1;
@@ -345,7 +351,7 @@ void CpuVoroOptimizer::MarkDirty(float x0, float y0, float x1, float y1)
 // ---------------------------------------------------------------------------
 // Optimisation
 // ---------------------------------------------------------------------------
-void CpuVoroOptimizer::BeginSchedule(int iterations, int cx0, int cy0, int cx1, int cy1)
+void VoroOptimizer::BeginSchedule(int iterations, int cx0, int cy0, int cx1, int cy1)
 {
     cx0 = std::max(cx0, 0), cy0 = std::max(cy0, 0);
     cx1 = std::min(cx1, mSlotsW), cy1 = std::min(cy1, mSlotsH);
@@ -395,10 +401,15 @@ void CpuVoroOptimizer::BeginSchedule(int iterations, int cx0, int cy0, int cx1, 
     mLastBatchLoss  = 0.0f;
 }
 
-// VoroLoss and its gradient (port of vorolossKernel) for one chunk of the
-// active targets. Gradients go to the chunk's own buffer, so chunks can run
+// VoroLoss and its gradient for one chunk of the active targets. With
+// u = p - c0, e = cj - c0, l = |e|, n = e / l:
+//   d        = <u, n> - l / 2
+//   dd/dcj   = (u - <u, n> n) / l - n / 2
+//   dd/dc0   = -n - dd/dcj
+// and dL/dc = 2 d dd/dc, summed here and divided by the number of contributing
+// targets in FinishIteration (loss.mean() in the reference). Gradients go to the chunk's own buffer, so chunks can run
 // concurrently; frozen generators ignore theirs.
-void CpuVoroOptimizer::LossChunk(int chunk, int iteration)
+void VoroOptimizer::LossChunk(int chunk, int iteration)
 {
     const size_t A     = mActiveSlots.size();
     Vec2        *grad  = mChunkGrad.data() + size_t(chunk) * A;
@@ -463,15 +474,15 @@ void CpuVoroOptimizer::LossChunk(int chunk, int iteration)
 }
 
 // Serial start of an iteration: re-bin the active generators.
-void CpuVoroOptimizer::BeginIteration()
+void VoroOptimizer::BeginIteration()
 {
     ++mIteration;
     mActiveGrid.Build(mActiveSlots, mGen, kGridCellScale * mSpacing);
 }
 
 // Serial end of an iteration: sum the loss chunks in chunk order, then Adam
-// (port of adamKernel).
-void CpuVoroOptimizer::FinishIteration()
+// with the MultiStepLR schedule, then clamp to the domain.
+void VoroOptimizer::FinishIteration()
 {
     const int t      = mIteration;
     const int chunks = (int)mChunkLoss.size();
@@ -515,7 +526,7 @@ void CpuVoroOptimizer::FinishIteration()
     }
 }
 
-float CpuVoroOptimizer::Step(int iterations)
+float VoroOptimizer::Step(int iterations)
 {
     if (iterations <= 0 || NumSlots() == 0)
         return 0.0f;
@@ -527,7 +538,7 @@ float CpuVoroOptimizer::Step(int iterations)
     return std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-float CpuVoroOptimizer::EvaluateLoss()
+float VoroOptimizer::EvaluateLoss()
 {
     mLive.clear();
     for (int i = 0; i < NumSlots(); ++i)
@@ -568,9 +579,11 @@ float CpuVoroOptimizer::EvaluateLoss()
 // Extraction
 // ---------------------------------------------------------------------------
 
-// Port of voronoiCellKernel: clip the domain box by neighbour bisectors,
-// certified by the security radius, then occupancy from the centroid.
-void CpuVoroOptimizer::ClipCell(int i, const PointGrid &all, int &unsafe, int &overflow)
+// Clip the domain box by the bisectors of the nearest neighbours (in double
+// precision, relative to the generator), certified by the security radius
+// |cj - ci| > 2 max|v - ci|, with a brute-force fallback; then occupancy from
+// the canvas at the centroid.
+void VoroOptimizer::ClipCell(int i, const PointGrid &all, int &unsafe, int &overflow)
 {
     Cell &cell = mCells[i];
     Vec2  ci   = mGen[i];
@@ -650,7 +663,121 @@ void CpuVoroOptimizer::ClipCell(int i, const PointGrid &all, int &unsafe, int &o
     }
 }
 
-VoroMesh2D CpuVoroOptimizer::Extract()
+// The inside cell that owns surface point p: its nearest generator if that
+// cell is inside, else the inside neighbour whose bisector with it is closest
+// to p (the boundary edge p was fitted to, as in VoroLoss).
+int VoroOptimizer::OwnerOf(Vec2 p) const
+{
+    Knn<kLossK> knn;
+    Search(mAllGrid, p, knn);
+    int i0 = knn.idx[0];
+    if (i0 < 0 || mCells[i0].inside)
+        return i0;
+    Vec2  c0 = mGen[i0];
+    Vec2  u{p.x - c0.x, p.y - c0.y};
+    float best  = FLT_MAX;
+    int   owner = -1;
+    for (int k = 1; k < kLossK && knn.idx[k] >= 0; ++k) {
+        int j = knn.idx[k];
+        if (!mCells[j].inside)
+            continue;
+        Vec2  e{mGen[j].x - c0.x, mGen[j].y - c0.y};
+        float l = std::sqrt(Dot(e, e));
+        if (l < 1e-12f)
+            continue;
+        float d = std::fabs(Dot(u, e) / l - 0.5f * l);
+        if (d < best) {
+            best  = d;
+            owner = j;
+        }
+    }
+    return owner;
+}
+
+// CSR cells and the boundary mesh from the persistent cell polygons.
+// `mesh.inside` must already be set.
+void VoroOptimizer::Assemble(VoroMesh2D &mesh) const
+{
+    const int n = NumSlots();
+
+    mesh.cellStart.assign(n + 1, 0);
+    mesh.bandCells = 0;
+    for (int i = 0; i < n; ++i) {
+        mesh.cellStart[i + 1] = mesh.cellStart[i] + mCells[i].n;
+        mesh.bandCells += mCells[i].n > 0;
+    }
+    mesh.cellVerts.resize(mesh.cellStart[n]);
+    mesh.cellNeighbors.resize(mesh.cellStart[n]);
+    for (int i = 0; i < n; ++i) {
+        std::copy_n(mCells[i].v, mCells[i].n, mesh.cellVerts.begin() + mesh.cellStart[i]);
+        std::copy_n(mCells[i].e, mCells[i].n, mesh.cellNeighbors.begin() + mesh.cellStart[i]);
+    }
+
+    // Boundary edges: every edge of an inside cell whose other side is an
+    // outside cell or the domain box. A cell vertex sits between edges with
+    // labels a and b, so it is equidistant to generators {i, a, b}; that
+    // triple is its key, shared exactly by every cell that has the vertex.
+    auto key = [](int a, int b, int c) {
+        uint64_t v0 = uint64_t(a + kBoxLabels), v1 = uint64_t(b + kBoxLabels), v2 = uint64_t(c + kBoxLabels);
+        if (v0 > v1) std::swap(v0, v1);
+        if (v1 > v2) std::swap(v1, v2);
+        if (v0 > v1) std::swap(v0, v1);
+        return (v0 << 42) | (v1 << 21) | v2;
+    };
+    std::unordered_map<uint64_t, int> vertexOf;
+    auto vertex = [&](uint64_t k, Vec2 p) {
+        auto [it, inserted] = vertexOf.try_emplace(k, (int)mesh.vertices.size());
+        if (inserted) mesh.vertices.push_back(p);
+        return it->second;
+    };
+    mesh.shell.assign(n, 0);
+    mesh.shellCells = 0;
+    for (int i = 0; i < n; ++i) {
+        if (!mesh.inside[i]) continue;
+        const Cell &cell = mCells[i];
+        const int   c    = cell.n;
+        for (int k = 0; k < c; ++k) {
+            int l = cell.e[k];
+            if (l >= 0 && mesh.inside[l]) continue;
+            int prev = cell.e[(k + c - 1) % c], next = cell.e[(k + 1) % c];
+            int a = vertex(key(i, prev, l), cell.v[k]);
+            int b = vertex(key(i, l, next), cell.v[(k + 1) % c]);
+            mesh.edges.push_back({a, b});
+            mesh.edgeCell.push_back(i);
+            if (!mesh.shell[i]) {
+                mesh.shell[i] = 1;
+                ++mesh.shellCells;
+            }
+        }
+    }
+
+    // Watertight iff each vertex has exactly one outgoing and one incoming edge.
+    std::vector<int> next(mesh.vertices.size(), -1), out(mesh.vertices.size(), -1), inDeg(mesh.vertices.size(), 0);
+    mesh.watertight = true;
+    for (size_t e = 0; e < mesh.edges.size(); ++e) {
+        auto [a, b] = mesh.edges[e];
+        if (next[a] != -1) mesh.watertight = false;
+        next[a] = b;
+        out[a]  = (int)e;
+        ++inDeg[b];
+    }
+    for (size_t v = 0; v < next.size(); ++v)
+        if (next[v] == -1 || inDeg[v] != 1) mesh.watertight = false;
+    mesh.edgeLoop.assign(mesh.edges.size(), -1);
+    if (mesh.watertight) {
+        std::vector<uint8_t> seen(next.size(), 0);
+        for (size_t v = 0; v < next.size(); ++v) {
+            if (seen[v]) continue;
+            for (int w = (int)v; !seen[w]; w = next[w]) {
+                seen[w]               = 1;
+                mesh.edgeLoop[out[w]] = mesh.loops;
+            }
+            ++mesh.loops;
+        }
+    }
+}
+
+VoroMesh2D VoroOptimizer::Extract()
 {
     VoroMesh2D mesh;
     int        n = NumSlots();
@@ -668,16 +795,18 @@ VoroMesh2D CpuVoroOptimizer::Extract()
     // spacing here), and the band test looks kBandSpacings around each
     // generator, so re-processing everything within four spacings of the
     // changes is conservative.
+    // The same box decides which target owners are re-assigned.
+    const float m  = 4.0f * mSpacing;
+    const float x0 = mDirtyBox[0] - m, y0 = mDirtyBox[1] - m, x1 = mDirtyBox[2] + m, y1 = mDirtyBox[3] + m;
+    auto        in = [&](float x, float y) { return mDirty && x >= x0 && x <= x1 && y >= y0 && y <= y1; };
+    const bool  allCells = !mCellsValid;
     std::vector<int> todo;
-    if (!mCellsValid) {
+    if (allCells) {
         mCells.assign(n, Cell{});
         todo.resize(n);
         for (int i = 0; i < n; ++i)
             todo[i] = i;
     } else if (mDirty) {
-        float m  = 4.0f * mSpacing;
-        float x0 = mDirtyBox[0] - m, y0 = mDirtyBox[1] - m, x1 = mDirtyBox[2] + m, y1 = mDirtyBox[3] + m;
-        auto  in = [&](float x, float y) { return x >= x0 && x <= x1 && y >= y0 && y <= y1; };
         for (int i = 0; i < n; ++i) {
             float ox = (i % mSlotsW + 0.5f) * mSlotCellSize, oy = (i / mSlotsW + 0.5f) * mSlotCellSize;
             if (in(ox, oy) || (mGen[i].x >= 0.0f && in(mGen[i].x, mGen[i].y)))
@@ -737,27 +866,46 @@ VoroMesh2D CpuVoroOptimizer::Extract()
         }
     }
 
-    mCellsValid        = true;
-    mDirty             = false;
     mesh.unsafeCells   = unsafe;
     mesh.overflowCells = overflow;
     mesh.clippedCells  = clipped;
     mesh.promotedCells = promoted;
     auto t1            = std::chrono::steady_clock::now();
 
+    // Owners of the target points near the changes (all of them after a reset).
+    // Edits only add targets inside the changed occupancy tiles, so new slots
+    // fall in the box too.
+    const bool allTargets = allCells || !mOwnersValid;
+    mTargetOwner.resize(mTargets.size(), -1);
+    std::vector<int> ownerTodo;
+    for (int t = 0; t < (int)mTargets.size(); ++t) {
+        Vec2 p = mTargets[t];
+        if (!(p.x >= 0.0f))
+            mTargetOwner[t] = -1;
+        else if (allTargets || in(p.x, p.y))
+            ownerTodo.push_back(t);
+    }
+    RunTasks(mExec, int((ownerTodo.size() + kSlotsPerChunk - 1) / kSlotsPerChunk), [&](int c) {
+        const size_t end = std::min(ownerTodo.size(), size_t(c + 1) * kSlotsPerChunk);
+        for (size_t k = size_t(c) * kSlotsPerChunk; k < end; ++k)
+            mTargetOwner[ownerTodo[k]] = OwnerOf(mTargets[ownerTodo[k]]);
+    });
+    mCellsValid  = true;
+    mOwnersValid = true;
+    mDirty       = false;
+    auto t2      = std::chrono::steady_clock::now();
+
     mesh.generators = mGen;
     mesh.inside.resize(n);
     for (int i = 0; i < n; ++i)
         mesh.inside[i] = mCells[i].inside;
-    detail::AssembleMesh(mesh, n, [&](int i, int &c, const Vec2 *&v, const int *&e) {
-        c = mCells[i].n;
-        v = mCells[i].v;
-        e = mCells[i].e;
-    });
+    mesh.targetOwner = mTargetOwner;
+    Assemble(mesh);
 
-    auto t2         = std::chrono::steady_clock::now();
+    auto t3         = std::chrono::steady_clock::now();
     mesh.cellsMs    = std::chrono::duration<float, std::milli>(t1 - t0).count();
-    mesh.assemblyMs = std::chrono::duration<float, std::milli>(t2 - t1).count();
+    mesh.ownersMs   = std::chrono::duration<float, std::milli>(t2 - t1).count();
+    mesh.assemblyMs = std::chrono::duration<float, std::milli>(t3 - t2).count();
     return mesh;
 }
 

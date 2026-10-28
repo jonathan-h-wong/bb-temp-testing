@@ -7,7 +7,7 @@
 
 namespace voromesh {
 
-/// Same layout as CUDA's float2.
+/// Same layout as poisson::Sample, so Poisson cells can be used as generator slots.
 struct Vec2
 {
     float x, y;

@@ -93,10 +93,7 @@ endif()
 # ---------------------------------------------------------------------------
 # poisson – GPU Poisson disk sampling (grid-based parallel dart throwing)
 # ---------------------------------------------------------------------------
-add_library(poisson
-    poisson/poisson_disk.cu
-    poisson/poisson_disk_cpu.cpp
-)
+add_library(poisson poisson/poisson_disk.cu)
 
 target_include_directories(poisson
     PUBLIC
@@ -119,13 +116,29 @@ if(MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
-# voromesh – 2D VoroMesh: canvas (CPU) + CUDA optimiser
+# poisson_cpu – serial CPU Poisson disk sampling (same grid as poisson)
+# ---------------------------------------------------------------------------
+add_library(poisson_cpu poisson/poisson_disk_cpu.cpp)
+
+target_include_directories(poisson_cpu
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+
+if(MSVC)
+    target_compile_options(poisson_cpu PRIVATE /W3)
+endif()
+
+# ---------------------------------------------------------------------------
+# voromesh – 2D VoroMesh: canvas + optimiser/extraction (CPU, optional
+# parallelism through voromesh::Executor)
 # ---------------------------------------------------------------------------
 add_library(voromesh
     voromesh/shape2d.cpp
     voromesh/canvas.cpp
-    voromesh/voro_optimizer.cu
-    voromesh/cpu_voro_optimizer.cpp
+    voromesh/voro_optimizer.cpp
+    voromesh/components.cpp
 )
 
 target_include_directories(voromesh
@@ -134,21 +147,6 @@ target_include_directories(voromesh
         $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(voromesh
-    PUBLIC
-        CUDA::cudart
-)
-
-set_target_properties(voromesh PROPERTIES
-    CUDA_ARCHITECTURES native
-    CUDA_STANDARD 17
-    CUDA_STANDARD_REQUIRED ON
-)
-
 if(MSVC)
-    target_compile_options(voromesh PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:/W3>
-        $<$<COMPILE_LANGUAGE:CXX>:/MP>
-        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
-    )
+    target_compile_options(voromesh PRIVATE /W3 /MP)
 endif()
